@@ -1,14 +1,16 @@
-use clap::{Parser};
-use pnet::datalink::{self, Channel::Ethernet, Config};
-use pnet::packet::{ethernet::EthernetPacket, MutablePacket};
-use pnet::packet::Packet;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use tokio::task;
-use tokio::runtime::Runtime;
-use std::env;
-use log::{info, error,debug};
+use clap::Parser;
 use env_logger::Builder;
+use log::{debug, error, info};
+use pnet::datalink::{self, Channel::Ethernet, Config};
+use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
+use std::env;
+use std::sync::Arc;
+use tokio::signal;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 /// Command-line arguments for the program
 #[derive(Parser)]
 #[command(name = "Packet Forwarder")]
@@ -22,111 +24,186 @@ struct Args {
     #[arg(long)]
     internal_iface: String,
 }
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     env::set_var("RUST_BACKTRACE", "1");
-     // Initialize env_logger
-       // You can set the level in code here
+    // Initialize env_logger
+    // You can set the level in code here
     Builder::new()
-    .filter_level(log::LevelFilter::Debug)  // Set to Debug level in code
-    .init();
+        .filter_level(log::LevelFilter::Debug) // Set to Debug level in code
+        .init();
     // Parse command-line arguments using clap
     let args = Args::parse();
-
-    // Select network interfaces by name
+    // Get the network interfaces inside the async block to ensure it lives long enough
     let interfaces = datalink::interfaces();
-      // Get the network interfaces inside the async block to ensure it lives long enough
-      let interfaces = datalink::interfaces();
-    
-         // Find the external interface
-    let external_iface = interfaces
-    .iter()
-    .find(|iface| iface.name == args.external_iface)
-    .expect("No matching external interface found")
-    .clone();  // Clone the interface to avoid borrowing issues
 
-// Find the internal interface
-let internal_iface = interfaces
-    .iter()
-    .find(|iface| iface.name == args.internal_iface)
-    .expect("No matching internal interface found")
-    .clone();  // Clone the interface to avoid borrowing issues
-    info!("Using interfaces: {},ip:{:?} and {}, ip:{:?}", external_iface.name,external_iface.ips ,internal_iface.name,internal_iface.ips);
+    // Find the external interface
+    let external_iface = interfaces
+        .iter()
+        .find(|iface| iface.name == args.external_iface)
+        .expect("No matching external interface found")
+        .clone(); // Clone the interface to avoid borrowing issues
+
+    // Find the internal interface
+    let internal_iface = interfaces
+        .iter()
+        .find(|iface| iface.name == args.internal_iface)
+        .expect("No matching internal interface found")
+        .clone(); // Clone the interface to avoid borrowing issues
+    info!(
+        "Using interfaces: {},ip:{:?} and {}, ip:{:?}",
+        external_iface.name, external_iface.ips, internal_iface.name, internal_iface.ips
+    );
 
     // Create channels for both interfaces
     let config = Config::default();
-    let (mut external_tx, mut external_rx) = match datalink::channel(&external_iface, config.clone()) {
+    let (mut tx1, mut rx1) = match datalink::channel(&external_iface, config.clone()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel for {}: {}", external_iface.name, e),
+        Err(e) => panic!(
+            "Failed to create datalink channel for {}: {}",
+            external_iface.name, e
+        ),
     };
-    let (mut internal_tx, internal_rx) = match datalink::channel(&internal_iface, config) {
+    let (mut tx2, mut rx2) = match datalink::channel(&internal_iface, config) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel for {}: {}", internal_iface.name, e),   
+        Err(e) => panic!(
+            "Failed to create datalink channel for {}: {}",
+            internal_iface.name, e
+        ),
     };
- // Log some messages
-    // // Wrap receivers in Arc<Mutex>
-    // let external_rx = Arc::new(Mutex::new(external_rx));
-    // let internal_rx = Arc::new(Mutex::new(internal_rx));
-    
-    // // Create mpsc channels for forwarding packets
-    let (external_queue_tx, mut external_queue_rx) = mpsc::channel::<EthernetPacket>(100);
-    let (internal_queue_tx, mut internal_queue_rx) = mpsc::channel::<EthernetPacket>(100);
 
-    // // Spawn task for receiving packets on external_iface
-    let external_iface_arc = Arc::new(external_iface.clone());
-    let external_iface_arc_clone = Arc::clone(&external_iface_arc);
+    // Wrap `tx1` and `tx2` in Arc<Mutex<>> for thread-safe access
+    let tx1 = Arc::new(Mutex::new(tx1));
+    let tx2 = Arc::new(Mutex::new(tx2));
+    // Create a CancellationToken
+    let token = CancellationToken::new();
 
-    task::spawn(async move {
+    let token1 = token.clone();
+    let token2 = token.clone();
+
+    // Spawn a blocking thread for packet processing (capture loop) on eth0
+    let internal_task = tokio::spawn(async move {
+        info!("Starting packet capture on {}...", internal_iface.name);
         loop {
-            match external_rx.next() {
-                Ok(packet) => {
-                    if let Some(ethernet_packet) = EthernetPacket::new(packet) {
-                        debug!("Received packet on {}: {:?}", external_iface_arc.as_ref().name, ethernet_packet);
-                        // Apply filtering logic here
-                        if should_forward(&ethernet_packet) {
-                            if let Err(e) = external_queue_tx.send(ethernet_packet.to_immutable()).await {
-                                error!("Failed to send packet from {}: {}",external_iface_arc.as_ref().name, e);
-                            }
+            tokio::select! {
+                // Step 3: Use the cancellation token
+                _ = token1.cancelled() => {
+                    // Token was cancelled, clean up and exit task
+                    info!("Cancellation token triggered, shutting down capture on {}...",internal_iface.name);
+                    break;
+                }
+                 // The loop to receive packets and forward them to eth1
+            _ = async {
+                match rx1.next() {
+                    Ok(frame) => {
+                        let frame_data = frame.to_vec();
+                        debug!("Received frame on eth0: {:?}", frame_data);
+
+                        // Forward packet to eth1
+                        let tx_clone = Arc::clone(&tx2);
+
+                        process_packet(tx_clone, &frame_data).await;
+                    }
+                    Err(e) => error!("Error receiving packet on eth0: {}", e),
+                }
+            }=> {}
+            }
+        }
+        info!("Task for {} is cleaning up", internal_iface.name);
+    });
+
+    // Spawn another blocking thread for packet processing (capture loop) on eth1
+    let external_task = tokio::spawn(async move {
+        info!("Starting packet capture on {}...", external_iface.name);
+        loop {
+            tokio::select! {
+                // Step 3: Use the cancellation token
+                _ = token2.cancelled() => {
+                    // Token was cancelled, clean up and exit task
+                    info!("Cancellation token triggered, shutting down capture on {}...",external_iface.name);
+                    break;
+                }
+                 // The loop to receive packets and forward them to eth1
+            _ = async {
+                match rx2.next() {
+                    Ok(frame) => {
+                        let frame_data = frame.to_vec();
+                        debug!("Received frame on eth1: {:?}", frame_data);
+
+                        // Forward packet to eth0
+                        let tx_clone = Arc::clone(&tx1);
+
+                        process_packet(tx_clone, &frame_data).await;
+                    }
+                    Err(e) => error!("Error receiving packet on eth1: {}", e),
+                }
+            }=> {}
+            }
+        }
+        info!("Task for {} is cleaning up", external_iface.name);
+    });
+
+    // Gracefully handle shutdown (e.g., on SIGINT)
+    let shutdown = signal::ctrl_c().await;
+    if let Err(e) = shutdown {
+        error!("Error while waiting for shutdown signal: {}", e);
+    }
+    info!("Shutting down gracefully...");
+
+    // Send a cancellation signal
+    token.cancel();
+
+    // Wait for the tasks to finish
+    let _ = tokio::join!(external_task, internal_task);
+}
+
+// Async function to forward the packet to the destination interface
+async fn process_packet(tx: Arc<Mutex<Box<dyn pnet::datalink::DataLinkSender>>>, packet: &Vec<u8>) {
+    let mut tx = tx.lock().await; // Acquire lock asynchronously
+
+    if !should_forward(&packet).await {
+        debug!("packet dropped");
+    } else {
+        match tx.send_to(packet, None) {
+            Some(Ok(_)) => {
+                debug!("Forwarded packet: {:?}", packet);
+            }
+            Some(Err(e)) => {
+                error!("Error sending packet: {}", e);
+            }
+            None => error!("Error: Send failed, no destination address."),
+        }
+    }
+}
+
+async fn should_forward(packet: &Vec<u8>) -> bool {
+    if let Some(eth_packet) = EthernetPacket::new(&packet) {
+        debug!("Received packet: {:?}", eth_packet);
+
+        // Filter only IPv4 packets (EtherType 0x0800)
+        if eth_packet.get_ethertype().0 == 0x0800 {
+            if let Some(ip_packet) = Ipv4Packet::new(eth_packet.payload()) {
+                // Check if the protocol is UDP (protocol 17 for IPv4)
+                if ip_packet.get_next_level_protocol()
+                    == pnet::packet::ip::IpNextHeaderProtocols::Udp
+                {
+                    if let Some(udp_packet) = UdpPacket::new(ip_packet.payload()) {
+                        // Check if the UDP packet is using port 1900 (SSDP default port)
+                        if udp_packet.get_destination() == 1900 || udp_packet.get_source() == 1900 {
+                            debug!("SSDP packet detected");
+                            return true;
                         } else {
-                            debug!("Packet dropped by filter");
+                            info!("Non-SSDP UDP packet dropped");
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to read packet on {}: {}", external_iface.name, e);
-                }
             }
         }
-    });
+        info!("Non-IPv4 or non-UDP packet dropped");
+        return false;
+    }
 
-    
-
-    // // Spawn task for forwarding packets from external_iface to internal_iface
-    task::spawn(async move {
-
-        while let Some(packet) = external_queue_rx.recv().await {
-            debug!("Forwarding packet from {} to {}: {:?}", external_iface_arc_clone.as_ref().name, internal_iface.name, packet);
-
-            let mut buffer = vec![0u8; packet.packet().len()];
-            buffer.copy_from_slice(packet.packet());
-            if let Some(Err(e)) = internal_tx.send_to(&buffer, Some((*external_iface_arc_clone).clone())) {
- 
-                error!("Failed to send packet to {}: {}", internal_iface.name, e);
-            }
-        }
-    });
-
-
-
-    // // Keep the runtime running
-    // Runtime::new()?.block_on(tokio::signal::ctrl_c())?;
-    Ok(())
-}
-
-fn should_forward(packet: &EthernetPacket) -> bool {
-    // Example filter: Forward only packets with a specific EtherType (e.g., IPv4)
-    packet.get_ethertype().0 == 0x0800
+    false
 }
